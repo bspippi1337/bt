@@ -73,8 +73,12 @@ public class MainActivity extends Activity {
         row(root,btn("RUN BODY FUZZ",v->runFuzz()),btn("STOP FUZZ",v->stopFuzz()));
         root.addView(t("Standard: prefix/suffix beholdes, bare body muteres. Body må være eksplisitt satt. Standard SIG-identitetsfelt (2A00/2A23–2A29 osv.) er sperret fra fuzz. Aktiv fuzz krever ARM WRITES.",13));
 
+        section(root,"Maintenance");
+        row(root,btn("BUFFER CLEANER",v->cleanBuffers()),btn("LOG PURGE",v->purgeLog()));
+        root.addView(t("BUFFER CLEANER nullstiller appens scan/GATT/fuzz-state og UI-cacher. LOG PURGE sletter bare BT Toolkit sin egen JSONL-logg.",13));
+
         section(root,"Lab log");
-        log=mono("Logg: "+new File(getExternalFilesDir(null),"bt-lab.jsonl").getAbsolutePath()+"\n"); root.addView(log);
+        log=mono("Logg: "+logFile().getAbsolutePath()+"\n"); root.addView(log);
         setContentView(sv);
     }
 
@@ -103,7 +107,7 @@ public class MainActivity extends Activity {
     private void stopScan(){if(scanning&&scanner!=null)try{scanner.stopScan(scanCb);}catch(Exception ignored){}scanning=false;}
     private void refreshDevices(){deviceAdapter.clear();deviceAdapter.addAll(found.keySet());deviceAdapter.notifyDataSetChanged();}
     private void connectSelected(){Object o=deviceSpin.getSelectedItem();if(o==null){msg("Velg enhet");return;}BluetoothDevice d=found.get(o.toString());if(d==null)return;disconnect();try{msg("CONNECT "+d.getName()+" "+d.getAddress());gatt=d.connectGatt(this,false,gattCb,BluetoothDevice.TRANSPORT_LE);}catch(Exception e){msg("connect error: "+e);}}
-    private void disconnect(){stopFuzz();if(gatt!=null)try{gatt.disconnect();gatt.close();}catch(Exception ignored){}gatt=null;writable.clear();refreshChars();}
+    private void disconnect(){stopFuzz();if(gatt!=null)try{gatt.disconnect();gatt.close();}catch(Exception ignored){}gatt=null;writable.clear();nameChar=null;refreshChars();}
 
     private final BluetoothGattCallback gattCb=new BluetoothGattCallback(){
         @Override public void onConnectionStateChange(BluetoothGatt g,int status,int state){jlog("connection",kv("status",status,"state",state));if(state==BluetoothProfile.STATE_CONNECTED){msg("GATT connected; discoverServices");try{g.discoverServices();}catch(Exception e){msg("discover error "+e);}}else if(state==BluetoothProfile.STATE_DISCONNECTED){msg("GATT disconnected");stopFuzz();}}
@@ -133,11 +137,7 @@ public class MainActivity extends Activity {
     private int firstSuggestedWritableIndex(){int i=0;for(BluetoothGattCharacteristic c:writable.values()){if(!protectedForFuzz(c))return i;i++;}return writable.isEmpty()?-1:0;}
     private String props(BluetoothGattCharacteristic c){List<String>a=new ArrayList<>();int p=c.getProperties();if((p&2)!=0)a.add("read");if((p&8)!=0)a.add("write");if((p&4)!=0)a.add("writeNoRsp");if((p&16)!=0)a.add("notify");if((p&32)!=0)a.add("indicate");return String.join(",",a);}
     private boolean isWritable(BluetoothGattCharacteristic c){int p=c.getProperties();return (p&BluetoothGattCharacteristic.PROPERTY_WRITE)!=0||(p&BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)!=0;}
-    private boolean protectedForFuzz(BluetoothGattCharacteristic c){
-        String id=shortId(c.getUuid());
-        if(id.isEmpty())return false;
-        return id.equals("2a00")||id.equals("2a19")||id.equals("2a23")||id.equals("2a24")||id.equals("2a25")||id.equals("2a26")||id.equals("2a27")||id.equals("2a28")||id.equals("2a29");
-    }
+    private boolean protectedForFuzz(BluetoothGattCharacteristic c){String id=shortId(c.getUuid());if(id.isEmpty())return false;return id.equals("2a00")||id.equals("2a19")||id.equals("2a23")||id.equals("2a24")||id.equals("2a25")||id.equals("2a26")||id.equals("2a27")||id.equals("2a28")||id.equals("2a29");}
 
     private void renamePlan(){runOnUiThread(()->{String s;if(nameChar==null)s="Graffiti: 0x2A00 Device Name ikke synlig. Se etter vendor writable characteristic / app capture.";else if(isWritable(nameChar))s="Graffiti: 0x2A00 er writable. Persistent rename er en sterk kandidat. WRITE krever ARM WRITES; verifiser readback + reconnect + power-cycle + ny scan.";else s="Graffiti: 0x2A00 finnes, men er read-only. Ikke gjett. Lær vendor-protokollen fra captures.";msg(s);});}
     private void doRename(){String n=rename.getText().toString();if(n.isEmpty()){msg("Skriv navn");return;}if(nameChar==null||!isWritable(nameChar)){renamePlan();return;}byte[]v=n.getBytes(StandardCharsets.UTF_8);jlog("graffiti_rename_plan",kv("name",n,"hex",hex(v),"armed",arm.isChecked()));if(!arm.isChecked()){msg("DRY RUN rename: "+n+" / "+hex(v));return;}sendManual(nameChar,v,"rename");}
@@ -147,19 +147,28 @@ public class MainActivity extends Activity {
     private void previewFrame(){byte[]p=parse(prefix.getText().toString()),b=parse(body.getText().toString()),s=parse(suffix.getText().toString()),f=join(p,b,s);msg("FRAME prefix="+hex(p)+" body="+hex(b)+" suffix="+hex(s)+"\nFULL="+hex(f)+"\nB64="+Base64.encodeToString(f,Base64.NO_WRAP));}
     private void tagWrite(){BluetoothGattCharacteristic c=selectedChar();if(c==null){msg("Velg writable characteristic");return;}byte[]f=frame();jlog("graffiti_tag_plan",kv("uuid",c.getUuid().toString(),"frame",hex(f),"armed",arm.isChecked()));if(f.length==0){msg("TAG avvist: frame er tom. Sett body/tag eller prefix/suffix først.");jlog("write_rejected_local",kv("case","tag-empty","uuid",c.getUuid().toString(),"reason","empty_frame"));return;}if(!arm.isChecked()){msg("DRY RUN TAG → "+sig(c.getUuid())+"\n"+hex(f));return;}sendManual(c,f,"tag");}
 
-    private void runFuzz(){
-        BluetoothGattCharacteristic c=selectedChar();if(c==null){msg("Velg writable characteristic");return;}
-        if(protectedForFuzz(c)){msg("FUZZ SPERRET: "+sig(c.getUuid())+" er et standard identitets/statusfelt. Bruk Graffiti/rename eller velg vendor characteristic.");jlog("fuzz_rejected",kv("uuid",c.getUuid().toString(),"reason","protected_sig_characteristic"));return;}
-        long sd;int n;try{sd=Long.parseLong(seed.getText().toString().trim());}catch(Exception e){sd=4201337;}try{n=Integer.parseInt(count.getText().toString().trim());}catch(Exception e){n=16;}n=Math.max(1,Math.min(100,n));
-        byte[]pre=parse(prefix.getText().toString()),base=parse(body.getText().toString()),suf=parse(suffix.getText().toString());
-        if(base.length==0){msg("FUZZ SPERRET: body er tom. Sett en kjent baseline/body først; prefix/suffix muteres ikke som standard.");jlog("fuzz_rejected",kv("uuid",c.getUuid().toString(),"reason","empty_body"));return;}
-        Random r=new Random(sd);queue.clear();current=null;fuzzTarget=c;
-        for(int i=0;i<n;i++){byte[]m=base.clone();int idx=r.nextInt(m.length);m[idx]=(byte)r.nextInt(256);byte[]f=join(pre,m,suf);String id=sd+"-"+String.format(Locale.US,"%03d",i);jlog("fuzz_case",kv("case",id,"seed",sd,"index",idx,"target",c.getUuid().toString(),"prefix",hex(pre),"body",hex(m),"suffix",hex(suf),"frame",hex(f),"armed",arm.isChecked()));if(arm.isChecked())queue.add(new WriteCase(id,"fuzz",sd,f));}
-        if(!arm.isChecked()){fuzzTarget=null;msg("DRY RUN: genererte "+n+" cases. Se JSONL-logg.");return;}
-        msg("ARMED fuzz: "+n+" cases → "+sig(c.getUuid())+", rate-limited");nextWrite();
-    }
+    private void runFuzz(){BluetoothGattCharacteristic c=selectedChar();if(c==null){msg("Velg writable characteristic");return;}if(protectedForFuzz(c)){msg("FUZZ SPERRET: "+sig(c.getUuid())+" er et standard identitets/statusfelt. Bruk Graffiti/rename eller velg vendor characteristic.");jlog("fuzz_rejected",kv("uuid",c.getUuid().toString(),"reason","protected_sig_characteristic"));return;}long sd;int n;try{sd=Long.parseLong(seed.getText().toString().trim());}catch(Exception e){sd=4201337;}try{n=Integer.parseInt(count.getText().toString().trim());}catch(Exception e){n=16;}n=Math.max(1,Math.min(100,n));byte[]pre=parse(prefix.getText().toString()),base=parse(body.getText().toString()),suf=parse(suffix.getText().toString());if(base.length==0){msg("FUZZ SPERRET: body er tom. Sett en kjent baseline/body først; prefix/suffix muteres ikke som standard.");jlog("fuzz_rejected",kv("uuid",c.getUuid().toString(),"reason","empty_body"));return;}Random r=new Random(sd);queue.clear();current=null;fuzzTarget=c;for(int i=0;i<n;i++){byte[]m=base.clone();int idx=r.nextInt(m.length);m[idx]=(byte)r.nextInt(256);byte[]f=join(pre,m,suf);String id=sd+"-"+String.format(Locale.US,"%03d",i);jlog("fuzz_case",kv("case",id,"seed",sd,"index",idx,"target",c.getUuid().toString(),"prefix",hex(pre),"body",hex(m),"suffix",hex(suf),"frame",hex(f),"armed",arm.isChecked()));if(arm.isChecked())queue.add(new WriteCase(id,"fuzz",sd,f));}if(!arm.isChecked()){fuzzTarget=null;msg("DRY RUN: genererte "+n+" cases. Se JSONL-logg.");return;}msg("ARMED fuzz: "+n+" cases → "+sig(c.getUuid())+", rate-limited");nextWrite();}
     private void stopFuzz(){queue.clear();current=null;fuzzTarget=null;msg("Fuzz queue cleared");}
     private void nextWrite(){if(current!=null||queue.isEmpty()||gatt==null)return;BluetoothGattCharacteristic c=fuzzTarget;if(c==null||protectedForFuzz(c)){queue.clear();fuzzTarget=null;return;}current=queue.poll();if(!write(c,current.data)){jlog("write_rejected_local",kv("case",current.id,"uuid",c.getUuid().toString()));current=null;h.postDelayed(this::nextWrite,240);}else if(queue.isEmpty()){h.postDelayed(()->{if(current==null)fuzzTarget=null;},600);}}
+
+    private void cleanBuffers(){
+        stopScan();
+        queue.clear();current=null;fuzzTarget=null;
+        if(gatt!=null)try{gatt.disconnect();gatt.close();}catch(Exception ignored){}
+        gatt=null;scanner=null;nameChar=null;
+        found.clear();writable.clear();refreshDevices();refreshChars();
+        prefix.setText("");body.setText("");suffix.setText("");
+        arm.setChecked(false);
+        map.setText("Ingen GATT-data ennå.");
+        jlog("buffer_clean",kv("scan",true,"gatt",true,"queue",true,"ui",true));
+        msg("BUFFER CLEANER: app-state nullstilt.");
+    }
+    private File logFile(){return new File(getExternalFilesDir(null),"bt-lab.jsonl");}
+    private void purgeLog(){
+        File f=logFile(); long old=f.exists()?f.length():0; boolean ok=!f.exists()||f.delete();
+        log.setText("Logg: "+f.getAbsolutePath()+"\n");
+        msg(ok?"LOG PURGE: slettet "+old+" bytes.":"LOG PURGE feilet.");
+    }
 
     private void sendManual(BluetoothGattCharacteristic c,byte[]v,String kind){jlog("write_submit",kv("kind",kind,"uuid",c.getUuid().toString(),"hex",hex(v)));if(write(c,v)&&c==nameChar&&(c.getProperties()&BluetoothGattCharacteristic.PROPERTY_READ)!=0)h.postDelayed(()->{try{gatt.readCharacteristic(c);}catch(Exception ignored){}},700);}
     @SuppressWarnings("deprecation") private boolean write(BluetoothGattCharacteristic c,byte[]v){if(gatt==null)return false;try{int wt=(c.getProperties()&BluetoothGattCharacteristic.PROPERTY_WRITE)!=0?BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT:BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE;if(Build.VERSION.SDK_INT>=33)return gatt.writeCharacteristic(c,v,wt)==BluetoothStatusCodes.SUCCESS;c.setWriteType(wt);c.setValue(v);return gatt.writeCharacteristic(c);}catch(Exception e){msg("write exception "+e);return false;}}
@@ -174,6 +183,6 @@ public class MainActivity extends Activity {
     private String sigName(UUID u){switch(shortId(u)){case"1800":return"Generic Access";case"1801":return"Generic Attribute";case"180a":return"Device Information";case"180f":return"Battery Service";case"2a00":return"Device Name";case"2a19":return"Battery Level";case"2a23":return"System ID";case"2a24":return"Model Number";case"2a25":return"Serial Number";case"2a26":return"Firmware Revision";case"2a27":return"Hardware Revision";case"2a28":return"Software Revision";case"2a29":return"Manufacturer Name";default:return u.toString().equalsIgnoreCase("6e400001-b5a3-f393-e0a9-e50e24dcca9e")?"Nordic UART Service":u.toString().equalsIgnoreCase("6e400002-b5a3-f393-e0a9-e50e24dcca9e")?"NUS RX/write":u.toString().equalsIgnoreCase("6e400003-b5a3-f393-e0a9-e50e24dcca9e")?"NUS TX/notify":"";}}
 
     private Map<String,Object> kv(Object...x){Map<String,Object>m=new LinkedHashMap<>();for(int i=0;i+1<x.length;i+=2)m.put(String.valueOf(x[i]),x[i+1]);return m;}
-    private void jlog(String event,Map<String,Object> fields){try{JSONObject o=new JSONObject();o.put("ts",System.currentTimeMillis());o.put("event",event);for(Map.Entry<String,Object>e:fields.entrySet())o.put(e.getKey(),e.getValue());File f=new File(getExternalFilesDir(null),"bt-lab.jsonl");try(FileWriter w=new FileWriter(f,true)){w.write(o.toString()+"\n");}}catch(Exception ignored){}}
+    private void jlog(String event,Map<String,Object> fields){try{JSONObject o=new JSONObject();o.put("ts",System.currentTimeMillis());o.put("event",event);for(Map.Entry<String,Object>e:fields.entrySet())o.put(e.getKey(),e.getValue());File f=logFile();try(FileWriter w=new FileWriter(f,true)){w.write(o.toString()+"\n");}}catch(Exception ignored){}}
     private void msg(String s){runOnUiThread(()->{if(log!=null)log.append(s+"\n");});}
 }

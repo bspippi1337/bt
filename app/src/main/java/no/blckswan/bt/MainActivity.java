@@ -33,6 +33,7 @@ public class MainActivity extends Activity {
     private final ArrayDeque<WriteCase> queue = new ArrayDeque<>();
     private WriteCase current;
     private BluetoothGattCharacteristic nameChar;
+    private BluetoothGattCharacteristic fuzzTarget;
     private boolean scanning;
 
     static class WriteCase {
@@ -69,8 +70,8 @@ public class MainActivity extends Activity {
 
         section(root,"Seeded body fuzz");
         seed=field("Seed, f.eks. 4201337"); seed.setText("4201337"); count=field("Cases (1–100)"); count.setText("16"); root.addView(seed);root.addView(count);
-        row(root,btn("RUN BODY FUZZ",v->runFuzz()),btn("STOP FUZZ",v->{queue.clear();current=null;msg("Fuzz queue cleared");}));
-        root.addView(t("Standard: prefix/suffix beholdes, bare body muteres. Aktiv fuzz krever ARM WRITES. Disconnect stopper naturlig videre writes.",13));
+        row(root,btn("RUN BODY FUZZ",v->runFuzz()),btn("STOP FUZZ",v->stopFuzz()));
+        root.addView(t("Standard: prefix/suffix beholdes, bare body muteres. Body må være eksplisitt satt. Standard SIG-identitetsfelt (2A00/2A23–2A29 osv.) er sperret fra fuzz. Aktiv fuzz krever ARM WRITES.",13));
 
         section(root,"Lab log");
         log=mono("Logg: "+new File(getExternalFilesDir(null),"bt-lab.jsonl").getAbsolutePath()+"\n"); root.addView(log);
@@ -102,19 +103,41 @@ public class MainActivity extends Activity {
     private void stopScan(){if(scanning&&scanner!=null)try{scanner.stopScan(scanCb);}catch(Exception ignored){}scanning=false;}
     private void refreshDevices(){deviceAdapter.clear();deviceAdapter.addAll(found.keySet());deviceAdapter.notifyDataSetChanged();}
     private void connectSelected(){Object o=deviceSpin.getSelectedItem();if(o==null){msg("Velg enhet");return;}BluetoothDevice d=found.get(o.toString());if(d==null)return;disconnect();try{msg("CONNECT "+d.getName()+" "+d.getAddress());gatt=d.connectGatt(this,false,gattCb,BluetoothDevice.TRANSPORT_LE);}catch(Exception e){msg("connect error: "+e);}}
-    private void disconnect(){queue.clear();current=null;if(gatt!=null)try{gatt.disconnect();gatt.close();}catch(Exception ignored){}gatt=null;writable.clear();refreshChars();}
+    private void disconnect(){stopFuzz();if(gatt!=null)try{gatt.disconnect();gatt.close();}catch(Exception ignored){}gatt=null;writable.clear();refreshChars();}
 
     private final BluetoothGattCallback gattCb=new BluetoothGattCallback(){
-        @Override public void onConnectionStateChange(BluetoothGatt g,int status,int state){jlog("connection",kv("status",status,"state",state));if(state==BluetoothProfile.STATE_CONNECTED){msg("GATT connected; discoverServices");try{g.discoverServices();}catch(Exception e){msg("discover error "+e);}}else if(state==BluetoothProfile.STATE_DISCONNECTED){msg("GATT disconnected");queue.clear();current=null;}}
-        @Override public void onServicesDiscovered(BluetoothGatt g,int status){if(status!=BluetoothGatt.GATT_SUCCESS){msg("service discovery status="+status);return;}StringBuilder sb=new StringBuilder();writable.clear();nameChar=null;for(BluetoothGattService s:g.getServices()){sb.append("SERVICE ").append(sig(s.getUuid())).append("\n");for(BluetoothGattCharacteristic c:s.getCharacteristics()){String p=props(c);sb.append("  ").append(sig(c.getUuid())).append(" [").append(p).append("]\n");if(isWritable(c)){String key=s.getUuid()+" / "+c.getUuid()+" / "+sigName(c.getUuid());writable.put(key,c);}if(shortId(c.getUuid()).equals("2a00"))nameChar=c;}}runOnUiThread(()->{map.setText(sb.toString());refreshChars();renamePlan();});jlog("gatt_map",kv("services",g.getServices().size(),"writable",writable.size(),"nameChar",nameChar!=null));}
-        @Override public void onCharacteristicWrite(BluetoothGatt g,BluetoothGattCharacteristic c,int status){WriteCase done=current;jlog("write_result",kv("case",done==null?"manual":done.id,"uuid",c.getUuid().toString(),"status",status));msg("WRITE status="+status+" "+sig(c.getUuid()));if(done!=null){current=null;h.postDelayed(MainActivity.this::nextWrite,180);}}
+        @Override public void onConnectionStateChange(BluetoothGatt g,int status,int state){jlog("connection",kv("status",status,"state",state));if(state==BluetoothProfile.STATE_CONNECTED){msg("GATT connected; discoverServices");try{g.discoverServices();}catch(Exception e){msg("discover error "+e);}}else if(state==BluetoothProfile.STATE_DISCONNECTED){msg("GATT disconnected");stopFuzz();}}
+        @Override public void onServicesDiscovered(BluetoothGatt g,int status){
+            if(status!=BluetoothGatt.GATT_SUCCESS){msg("service discovery status="+status);return;}
+            StringBuilder sb=new StringBuilder();writable.clear();nameChar=null;
+            for(BluetoothGattService s:g.getServices()){
+                sb.append("SERVICE ").append(sig(s.getUuid())).append("\n");
+                jlog("gatt_service",kv("uuid",s.getUuid().toString(),"sig",sigName(s.getUuid()),"type",s.getType()));
+                for(BluetoothGattCharacteristic c:s.getCharacteristics()){
+                    String p=props(c);
+                    sb.append("  ").append(sig(c.getUuid())).append(" [").append(p).append("]\n");
+                    jlog("gatt_char",kv("service",s.getUuid().toString(),"uuid",c.getUuid().toString(),"sig",sigName(c.getUuid()),"props",p,"writable",isWritable(c),"fuzzProtected",protectedForFuzz(c)));
+                    if(isWritable(c)){String key=s.getUuid()+" / "+c.getUuid()+" / "+sigName(c.getUuid());writable.put(key,c);}
+                    if(shortId(c.getUuid()).equals("2a00"))nameChar=c;
+                }
+            }
+            runOnUiThread(()->{map.setText(sb.toString());refreshChars();renamePlan();});
+            jlog("gatt_map",kv("services",g.getServices().size(),"writable",writable.size(),"nameChar",nameChar!=null));
+        }
+        @Override public void onCharacteristicWrite(BluetoothGatt g,BluetoothGattCharacteristic c,int status){WriteCase done=current;jlog("write_result",kv("case",done==null?"manual":done.id,"uuid",c.getUuid().toString(),"status",status));msg("WRITE status="+status+" "+sig(c.getUuid()));if(done!=null){current=null;h.postDelayed(MainActivity.this::nextWrite,240);}}
         @Override public void onCharacteristicRead(BluetoothGatt g,BluetoothGattCharacteristic c,byte[] value,int status){jlog("readback",kv("uuid",c.getUuid().toString(),"status",status,"hex",hex(value),"utf8",new String(value,StandardCharsets.UTF_8)));msg("READBACK "+sig(c.getUuid())+" = "+hex(value)+" | "+new String(value,StandardCharsets.UTF_8));}
         @SuppressWarnings("deprecation") @Override public void onCharacteristicRead(BluetoothGatt g,BluetoothGattCharacteristic c,int status){if(Build.VERSION.SDK_INT<33){byte[]v=c.getValue();jlog("readback",kv("uuid",c.getUuid().toString(),"status",status,"hex",hex(v),"utf8",new String(v==null?new byte[0]:v,StandardCharsets.UTF_8)));}}
     };
 
-    private void refreshChars(){runOnUiThread(()->{charAdapter.clear();charAdapter.addAll(writable.keySet());charAdapter.notifyDataSetChanged();});}
+    private void refreshChars(){runOnUiThread(()->{charAdapter.clear();charAdapter.addAll(writable.keySet());charAdapter.notifyDataSetChanged();int i=firstSuggestedWritableIndex();if(i>=0)charSpin.setSelection(i);});}
+    private int firstSuggestedWritableIndex(){int i=0;for(BluetoothGattCharacteristic c:writable.values()){if(!protectedForFuzz(c))return i;i++;}return writable.isEmpty()?-1:0;}
     private String props(BluetoothGattCharacteristic c){List<String>a=new ArrayList<>();int p=c.getProperties();if((p&2)!=0)a.add("read");if((p&8)!=0)a.add("write");if((p&4)!=0)a.add("writeNoRsp");if((p&16)!=0)a.add("notify");if((p&32)!=0)a.add("indicate");return String.join(",",a);}
     private boolean isWritable(BluetoothGattCharacteristic c){int p=c.getProperties();return (p&BluetoothGattCharacteristic.PROPERTY_WRITE)!=0||(p&BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)!=0;}
+    private boolean protectedForFuzz(BluetoothGattCharacteristic c){
+        String id=shortId(c.getUuid());
+        if(id.isEmpty())return false;
+        return id.equals("2a00")||id.equals("2a19")||id.equals("2a23")||id.equals("2a24")||id.equals("2a25")||id.equals("2a26")||id.equals("2a27")||id.equals("2a28")||id.equals("2a29");
+    }
 
     private void renamePlan(){runOnUiThread(()->{String s;if(nameChar==null)s="Graffiti: 0x2A00 Device Name ikke synlig. Se etter vendor writable characteristic / app capture.";else if(isWritable(nameChar))s="Graffiti: 0x2A00 er writable. Persistent rename er en sterk kandidat. WRITE krever ARM WRITES; verifiser readback + reconnect + power-cycle + ny scan.";else s="Graffiti: 0x2A00 finnes, men er read-only. Ikke gjett. Lær vendor-protokollen fra captures.";msg(s);});}
     private void doRename(){String n=rename.getText().toString();if(n.isEmpty()){msg("Skriv navn");return;}if(nameChar==null||!isWritable(nameChar)){renamePlan();return;}byte[]v=n.getBytes(StandardCharsets.UTF_8);jlog("graffiti_rename_plan",kv("name",n,"hex",hex(v),"armed",arm.isChecked()));if(!arm.isChecked()){msg("DRY RUN rename: "+n+" / "+hex(v));return;}sendManual(nameChar,v,"rename");}
@@ -122,10 +145,21 @@ public class MainActivity extends Activity {
     private BluetoothGattCharacteristic selectedChar(){Object o=charSpin.getSelectedItem();return o==null?null:writable.get(o.toString());}
     private byte[] frame(){return join(parse(prefix.getText().toString()),parse(body.getText().toString()),parse(suffix.getText().toString()));}
     private void previewFrame(){byte[]p=parse(prefix.getText().toString()),b=parse(body.getText().toString()),s=parse(suffix.getText().toString()),f=join(p,b,s);msg("FRAME prefix="+hex(p)+" body="+hex(b)+" suffix="+hex(s)+"\nFULL="+hex(f)+"\nB64="+Base64.encodeToString(f,Base64.NO_WRAP));}
-    private void tagWrite(){BluetoothGattCharacteristic c=selectedChar();if(c==null){msg("Velg writable characteristic");return;}byte[]f=frame();jlog("graffiti_tag_plan",kv("uuid",c.getUuid().toString(),"frame",hex(f),"armed",arm.isChecked()));if(!arm.isChecked()){msg("DRY RUN TAG → "+sig(c.getUuid())+"\n"+hex(f));return;}sendManual(c,f,"tag");}
+    private void tagWrite(){BluetoothGattCharacteristic c=selectedChar();if(c==null){msg("Velg writable characteristic");return;}byte[]f=frame();jlog("graffiti_tag_plan",kv("uuid",c.getUuid().toString(),"frame",hex(f),"armed",arm.isChecked()));if(f.length==0){msg("TAG avvist: frame er tom. Sett body/tag eller prefix/suffix først.");jlog("write_rejected_local",kv("case","tag-empty","uuid",c.getUuid().toString(),"reason","empty_frame"));return;}if(!arm.isChecked()){msg("DRY RUN TAG → "+sig(c.getUuid())+"\n"+hex(f));return;}sendManual(c,f,"tag");}
 
-    private void runFuzz(){BluetoothGattCharacteristic c=selectedChar();if(c==null){msg("Velg writable characteristic");return;}long sd;int n;try{sd=Long.parseLong(seed.getText().toString().trim());}catch(Exception e){sd=4201337;}try{n=Integer.parseInt(count.getText().toString().trim());}catch(Exception e){n=16;}n=Math.max(1,Math.min(100,n));byte[]pre=parse(prefix.getText().toString()),base=parse(body.getText().toString()),suf=parse(suffix.getText().toString());if(base.length==0)base=new byte[]{0};Random r=new Random(sd);queue.clear();for(int i=0;i<n;i++){byte[]m=base.clone();int idx=r.nextInt(m.length);m[idx]=(byte)r.nextInt(256);byte[]f=join(pre,m,suf);String id=sd+"-"+String.format(Locale.US,"%03d",i);jlog("fuzz_case",kv("case",id,"seed",sd,"index",idx,"prefix",hex(pre),"body",hex(m),"suffix",hex(suf),"frame",hex(f),"armed",arm.isChecked()));if(arm.isChecked())queue.add(new WriteCase(id,"fuzz",sd,f));}if(!arm.isChecked()){msg("DRY RUN: genererte "+n+" cases. Se JSONL-logg.");return;}msg("ARMED fuzz: "+n+" cases, rate-limited");nextWrite();}
-    private void nextWrite(){if(current!=null||queue.isEmpty()||gatt==null)return;BluetoothGattCharacteristic c=selectedChar();if(c==null){queue.clear();return;}current=queue.poll();if(!write(c,current.data)){jlog("write_rejected_local",kv("case",current.id,"uuid",c.getUuid().toString()));current=null;h.postDelayed(this::nextWrite,180);}}
+    private void runFuzz(){
+        BluetoothGattCharacteristic c=selectedChar();if(c==null){msg("Velg writable characteristic");return;}
+        if(protectedForFuzz(c)){msg("FUZZ SPERRET: "+sig(c.getUuid())+" er et standard identitets/statusfelt. Bruk Graffiti/rename eller velg vendor characteristic.");jlog("fuzz_rejected",kv("uuid",c.getUuid().toString(),"reason","protected_sig_characteristic"));return;}
+        long sd;int n;try{sd=Long.parseLong(seed.getText().toString().trim());}catch(Exception e){sd=4201337;}try{n=Integer.parseInt(count.getText().toString().trim());}catch(Exception e){n=16;}n=Math.max(1,Math.min(100,n));
+        byte[]pre=parse(prefix.getText().toString()),base=parse(body.getText().toString()),suf=parse(suffix.getText().toString());
+        if(base.length==0){msg("FUZZ SPERRET: body er tom. Sett en kjent baseline/body først; prefix/suffix muteres ikke som standard.");jlog("fuzz_rejected",kv("uuid",c.getUuid().toString(),"reason","empty_body"));return;}
+        Random r=new Random(sd);queue.clear();current=null;fuzzTarget=c;
+        for(int i=0;i<n;i++){byte[]m=base.clone();int idx=r.nextInt(m.length);m[idx]=(byte)r.nextInt(256);byte[]f=join(pre,m,suf);String id=sd+"-"+String.format(Locale.US,"%03d",i);jlog("fuzz_case",kv("case",id,"seed",sd,"index",idx,"target",c.getUuid().toString(),"prefix",hex(pre),"body",hex(m),"suffix",hex(suf),"frame",hex(f),"armed",arm.isChecked()));if(arm.isChecked())queue.add(new WriteCase(id,"fuzz",sd,f));}
+        if(!arm.isChecked()){fuzzTarget=null;msg("DRY RUN: genererte "+n+" cases. Se JSONL-logg.");return;}
+        msg("ARMED fuzz: "+n+" cases → "+sig(c.getUuid())+", rate-limited");nextWrite();
+    }
+    private void stopFuzz(){queue.clear();current=null;fuzzTarget=null;msg("Fuzz queue cleared");}
+    private void nextWrite(){if(current!=null||queue.isEmpty()||gatt==null)return;BluetoothGattCharacteristic c=fuzzTarget;if(c==null||protectedForFuzz(c)){queue.clear();fuzzTarget=null;return;}current=queue.poll();if(!write(c,current.data)){jlog("write_rejected_local",kv("case",current.id,"uuid",c.getUuid().toString()));current=null;h.postDelayed(this::nextWrite,240);}else if(queue.isEmpty()){h.postDelayed(()->{if(current==null)fuzzTarget=null;},600);}}
 
     private void sendManual(BluetoothGattCharacteristic c,byte[]v,String kind){jlog("write_submit",kv("kind",kind,"uuid",c.getUuid().toString(),"hex",hex(v)));if(write(c,v)&&c==nameChar&&(c.getProperties()&BluetoothGattCharacteristic.PROPERTY_READ)!=0)h.postDelayed(()->{try{gatt.readCharacteristic(c);}catch(Exception ignored){}},700);}
     @SuppressWarnings("deprecation") private boolean write(BluetoothGattCharacteristic c,byte[]v){if(gatt==null)return false;try{int wt=(c.getProperties()&BluetoothGattCharacteristic.PROPERTY_WRITE)!=0?BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT:BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE;if(Build.VERSION.SDK_INT>=33)return gatt.writeCharacteristic(c,v,wt)==BluetoothStatusCodes.SUCCESS;c.setWriteType(wt);c.setValue(v);return gatt.writeCharacteristic(c);}catch(Exception e){msg("write exception "+e);return false;}}
